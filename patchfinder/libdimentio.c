@@ -1,4 +1,4 @@
-/* Copyright 2020 0x7ff
+/* Copyright 2023 0x7ff
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,33 +13,55 @@
  * limitations under the License.
  */
 #include "libdimentio.h"
-#include "../rw_prov/rw_prov.h"
 #include <compression.h>
+#include <dlfcn.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
-#include <mach-o/nlist.h>
+#include <mach/mach.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/utsname.h>
 
 #include "kern_context.h"
-
-typedef uint64_t addr_t;
-#define kaddr_t addr_t
-
-#define PREBOOT_PATH "/private/preboot/"
-#define BOOT_PATH "/System/Library/Caches/com.apple.kernelcaches/kernelcache"
 
 #define LZSS_F (18)
 #define LZSS_N (4096)
 #define LZSS_THRESHOLD (2)
+#define IPC_ENTRY_SZ (0x18)
+#define OS_STRING_LEN_OFF (0xC)
 #define KCOMP_HDR_PAD_SZ (0x16C)
+#define OS_STRING_STRING_OFF (0x10)
+#define KALLOC_ARRAY_TYPE_BIT (47U)
+#define IPC_SPACE_IS_TABLE_OFF (0x20)
+#define IPC_ENTRY_IE_OBJECT_OFF (0x0)
+#define PROC_P_LIST_LE_PREV_OFF (0x8)
+#define OS_DICTIONARY_COUNT_OFF (0x14)
+#define PROC_P_LIST_LH_FIRST_OFF (0x0)
+#define OS_DICTIONARY_DICT_ENTRY_OFF (0x20)
+#define OS_STRING_LEN(a) extract32(a, 14, 18)
+#define LOADED_KEXT_SUMMARY_HDR_NAME_OFF (0x10)
+#define LOADED_KEXT_SUMMARY_HDR_ADDR_OFF (0x60)
+#if TARGET_OS_OSX
+#	define PREBOOT_PATH "/System/Volumes/Preboot"
+#else
+#	define PREBOOT_PATH "/private/preboot/"
+#endif
+#define IO_AES_ACCELERATOR_SPECIAL_KEYS_OFF (0xD0)
+#define APPLE_MOBILE_AP_NONCE_CLEAR_NONCE_SEL (0xC9)
+#define IO_AES_ACCELERATOR_SPECIAL_KEY_CNT_OFF (0xD8)
+#define APPLE_MOBILE_AP_NONCE_GENERATE_NONCE_SEL (0xC8)
+#define BOOT_PATH "/System/Library/Caches/com.apple.kernelcaches/kernelcache"
 
 #define DER_INT (0x2U)
 #define DER_SEQ (0x30U)
 #define DER_IA5_STR (0x16U)
 #define DER_OCTET_STR (0x4U)
+#define ARM_PGSHIFT_16K (14U)
+#define PROC_PIDREGIONINFO (7)
 #define RD(a) extract32(a, 0, 5)
 #define RN(a) extract32(a, 5, 5)
+#define VM_KERN_MEMORY_OSKEXT (5)
 #define KCOMP_HDR_MAGIC (0x636F6D70U)
 #define ADRP_ADDR(a) ((a) & ~0xFFFULL)
 #define ADRP_IMM(a) (ADR_IMM(a) << 12U)
@@ -48,15 +70,21 @@ typedef uint64_t addr_t;
 #define kIODeviceTreePlane "IODeviceTree"
 #define KCOMP_HDR_TYPE_LZSS (0x6C7A7373U)
 #define LDR_X_IMM(a) (sextract64(a, 5, 19) << 2U)
+#define kOSBundleLoadAddressKey "OSBundleLoadAddress"
 #define IS_ADR(a) (((a) & 0x9F000000U) == 0x10000000U)
 #define IS_ADRP(a) (((a) & 0x9F000000U) == 0x90000000U)
 #define IS_LDR_X(a) (((a) & 0xFF000000U) == 0x58000000U)
 #define IS_ADD_X(a) (((a) & 0xFFC00000U) == 0x91000000U)
+#define IS_SUBS_X(a) (((a) & 0xFF200000U) == 0xEB000000U)
 #define LDR_W_UNSIGNED_IMM(a) (extract32(a, 10, 12) << 2U)
 #define LDR_X_UNSIGNED_IMM(a) (extract32(a, 10, 12) << 3U)
+#define kBootNoncePropertyKey "com.apple.System.boot-nonce"
+#define kIONVRAMDeletePropertyKey "IONVRAM-DELETE-PROPERTY"
+#define kIONVRAMSyncNowPropertyKey "IONVRAM-SYNCNOW-PROPERTY"
 #define IS_LDR_W_UNSIGNED_IMM(a) (((a) & 0xFFC00000U) == 0xB9400000U)
 #define IS_LDR_X_UNSIGNED_IMM(a) (((a) & 0xFFC00000U) == 0xF9400000U)
 #define ADR_IMM(a) ((sextract64(a, 5, 19) << 2U) | extract32(a, 29, 2))
+#define kIONVRAMForceSyncNowPropertyKey "IONVRAM-FORCESYNCNOW-PROPERTY"
 
 #ifndef SECT_CSTRING
 #	define SECT_CSTRING "__cstring"
@@ -66,20 +94,24 @@ typedef uint64_t addr_t;
 #	define SEG_TEXT_EXEC "__TEXT_EXEC"
 #endif
 
+#ifndef MIN
+#	define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
 typedef char io_string_t[512];
+typedef uint32_t IOOptionBits;
 typedef mach_port_t io_object_t;
-typedef uint32_t IOOptionBits, ipc_entry_num_t;
+typedef kern_return_t (*kernrw_0_kbase_func_t)(kaddr_t *);
 typedef io_object_t io_service_t, io_connect_t, io_registry_entry_t;
+typedef int (*krw_0_kbase_func_t)(kaddr_t *), (*krw_0_kread_func_t)(kaddr_t, void *, size_t), (*krw_0_kwrite_func_t)(const void *, kaddr_t, size_t), (*kernrw_0_req_kernrw_func_t)(void);
 
 typedef struct {
 	struct section_64 s64;
-	const char *data;
+	char *data;
 } sec_64_t;
 
 typedef struct {
-	struct symtab_command cmd_symtab;
 	sec_64_t sec_text, sec_cstring;
-	kaddr_t base, kslide;
 	const char *kernel;
 	size_t kernel_sz;
 	char *data;
@@ -93,6 +125,9 @@ IOObjectRelease(io_object_t);
 
 CFMutableDictionaryRef
 IOServiceMatching(const char *);
+
+int
+proc_pidinfo(int, int, uint64_t, void *, int);
 
 CFDictionaryRef
 OSKextCopyLoadedKextInfo(CFArrayRef, CFArrayRef);
@@ -124,31 +159,21 @@ mach_vm_read_overwrite(vm_map_t, mach_vm_address_t, mach_vm_size_t, mach_vm_addr
 kern_return_t
 mach_vm_machine_attribute(vm_map_t, mach_vm_address_t, mach_vm_size_t, vm_machine_attribute_t, vm_machine_attribute_val_t *);
 
-kern_return_t
-mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *);
-
 extern const mach_port_t kIOMasterPortDefault;
 
-
-kern_return_t
-kread_buf(kaddr_t addr, void *buf, mach_vm_size_t sz) {
-	kernel_read(addr, buf, sz);
-	return KERN_SUCCESS;
-}
-
-kern_return_t
-kread_addr(kaddr_t addr, kaddr_t *val) {
-	return kread_buf(addr, val, sizeof(*val));
-}
-
-kern_return_t
-kwrite_buf(kaddr_t addr, const void *buf, mach_msg_type_number_t sz) {
-	kernel_write(addr, buf, sz);
-	return KERN_SUCCESS;
-}
-
+static int kmem_fd = -1;
+static unsigned t1sz_boot;
+static void *krw_0, *kernrw_0;
+static kread_func_t kread_buf;
+static task_t tfp0 = TASK_NULL;
+static uint64_t proc_struct_sz;
+static kwrite_func_t kwrite_buf;
+static krw_0_kread_func_t krw_0_kread;
+static krw_0_kwrite_func_t krw_0_kwrite;
+static bool has_proc_struct_sz, has_kalloc_array_decode, kalloc_array_decode_v2;
 kaddr_t p_kbase = 0, p_kslide = 0, allproc = 0;
-static kaddr_t kernproc;
+static kaddr_t kbase, kernproc, proc_struct_sz_ptr, vm_kernel_link_addr, our_task;
+static size_t proc_task_off, proc_p_pid_off, task_itk_space_off, io_dt_nvram_of_dict_off, ipc_port_ip_kobject_off;
 
 static uint32_t
 extract32(uint32_t val, unsigned start, unsigned len) {
@@ -158,6 +183,13 @@ extract32(uint32_t val, unsigned start, unsigned len) {
 static uint64_t
 sextract64(uint64_t val, unsigned start, unsigned len) {
 	return (uint64_t)((int64_t)(val << (64U - len - start)) >> (64U - len));
+}
+
+static void
+kxpacd(kaddr_t *addr) {
+	if(t1sz_boot != 0) {
+		*addr |= ~((1ULL << (64U - t1sz_boot)) - 1U);
+	}
 }
 
 static size_t
@@ -274,7 +306,134 @@ kdecompress(const void *src, size_t src_len, size_t *dst_len) {
 }
 
 static kern_return_t
-find_section(const char *p, struct segment_command_64 sg64, const char *sect_name, struct section_64 *sp) {
+kread_buf_krw_0(kaddr_t addr, void *buf, size_t sz) {
+	return krw_0_kread(addr, buf, sz) == 0 ? KERN_SUCCESS : KERN_FAILURE;
+}
+
+static kern_return_t
+kwrite_buf_krw_0(kaddr_t addr, const void *buf, size_t sz) {
+	return krw_0_kwrite(buf, addr, sz) == 0 ? KERN_SUCCESS : KERN_FAILURE;
+}
+
+static kern_return_t
+init_tfp0(void) {
+	kern_return_t ret = task_for_pid(mach_task_self(), 0, &tfp0);
+	mach_port_t host;
+	pid_t pid;
+
+	if(ret != KERN_SUCCESS) {
+		host = mach_host_self();
+		if(MACH_PORT_VALID(host)) {
+			printf("host: 0x%" PRIX32 "\n", host);
+			ret = host_get_special_port(host, HOST_LOCAL_NODE, 4, &tfp0);
+			mach_port_deallocate(mach_task_self(), host);
+		}
+	}
+	if(ret == KERN_SUCCESS && MACH_PORT_VALID(tfp0)) {
+		if(pid_for_task(tfp0, &pid) == KERN_SUCCESS) {
+			return ret;
+		}
+		mach_port_deallocate(mach_task_self(), tfp0);
+	}
+	return KERN_FAILURE;
+}
+
+static kern_return_t
+kread_buf_tfp0(kaddr_t addr, void *buf, size_t sz) {
+	mach_vm_address_t p = (mach_vm_address_t)buf;
+	mach_vm_size_t read_sz, out_sz = 0;
+
+	while(sz != 0) {
+		read_sz = MIN(sz, vm_kernel_page_size - (addr & vm_kernel_page_mask));
+		if(mach_vm_read_overwrite(tfp0, addr, read_sz, p, &out_sz) != KERN_SUCCESS || out_sz != read_sz) {
+			return KERN_FAILURE;
+		}
+		p += read_sz;
+		sz -= read_sz;
+		addr += read_sz;
+	}
+	return KERN_SUCCESS;
+}
+
+static kern_return_t
+kwrite_buf_tfp0(kaddr_t addr, const void *buf, size_t sz) {
+	vm_machine_attribute_val_t mattr_val = MATTR_VAL_CACHE_FLUSH;
+	mach_vm_address_t p = (mach_vm_address_t)buf;
+	mach_msg_type_number_t write_sz;
+
+	while(sz != 0) {
+		write_sz = (mach_msg_type_number_t)MIN(sz, vm_kernel_page_size - (addr & vm_kernel_page_mask));
+		if(mach_vm_write(tfp0, addr, p, write_sz) != KERN_SUCCESS || mach_vm_machine_attribute(tfp0, addr, write_sz, MATTR_CACHE, &mattr_val) != KERN_SUCCESS) {
+			return KERN_FAILURE;
+		}
+		p += write_sz;
+		sz -= write_sz;
+		addr += write_sz;
+	}
+	return KERN_SUCCESS;
+}
+
+static kern_return_t
+kread_buf_kmem(kaddr_t addr, void *buf, size_t sz) {
+	mach_vm_size_t read_sz;
+	char *p = buf;
+	ssize_t n;
+
+	while(sz != 0) {
+		read_sz = (mach_vm_size_t)MIN(sz, vm_kernel_page_size - (addr & vm_kernel_page_mask));
+		if((n = pread(kmem_fd, p, read_sz, (off_t)addr)) < 0 || (size_t)n != read_sz) {
+			return KERN_FAILURE;
+		}
+		p += read_sz;
+		sz -= read_sz;
+		addr += read_sz;
+	}
+	return KERN_SUCCESS;
+}
+
+static kern_return_t
+kwrite_buf_kmem(kaddr_t addr, const void *buf, size_t sz) {
+	mach_msg_type_number_t write_sz;
+	const char *p = buf;
+	ssize_t n;
+
+	while(sz != 0) {
+		write_sz = (mach_msg_type_number_t)MIN(sz, vm_kernel_page_size - (addr & vm_kernel_page_mask));
+		if((n = pwrite(kmem_fd, p, write_sz, (off_t)addr)) < 0 || (size_t)n != write_sz) {
+			return KERN_FAILURE;
+		}
+		p += write_sz;
+		sz -= write_sz;
+		addr += write_sz;
+	}
+	return KERN_SUCCESS;
+}
+
+static kern_return_t
+kread_addr(kaddr_t addr, kaddr_t *val) {
+	return kread_buf(addr, val, sizeof(*val));
+}
+
+static kern_return_t
+find_section_kernel(kaddr_t p, struct segment_command_64 sg64, const char *sect_name, struct section_64 *sp) {
+	for(; sg64.nsects-- != 0; p += sizeof(*sp)) {
+		if(kread_buf(p, sp, sizeof(*sp)) != KERN_SUCCESS) {
+			break;
+		}
+		if((sp->flags & SECTION_TYPE) != S_ZEROFILL) {
+			if(sp->offset < sg64.fileoff || sp->size > sg64.filesize || sp->offset - sg64.fileoff > sg64.filesize - sp->size) {
+				break;
+			}
+			if(sp->size != 0 && strncmp(sp->segname, sg64.segname, sizeof(sp->segname)) == 0 && strncmp(sp->sectname, sect_name, sizeof(sp->sectname)) == 0) {
+				return KERN_SUCCESS;
+			}
+		}
+	}
+	return KERN_FAILURE;
+}
+
+static kern_return_t
+find_section_macho(const char *p, struct segment_command_64 sg64, const char *sect_name, struct section_64 *sp) {
 	for(; sg64.nsects-- != 0; p += sizeof(*sp)) {
 		memcpy(sp, p, sizeof(*sp));
 		if((sp->flags & SECTION_TYPE) != S_ZEROFILL) {
@@ -295,6 +454,11 @@ sec_reset(sec_64_t *sec) {
 	sec->data = NULL;
 }
 
+static void
+sec_term(sec_64_t *sec) {
+	free(sec->data);
+}
+
 static kern_return_t
 sec_read_buf(sec_64_t sec, kaddr_t addr, void *buf, size_t sz) {
 	size_t off;
@@ -308,34 +472,193 @@ sec_read_buf(sec_64_t sec, kaddr_t addr, void *buf, size_t sz) {
 
 static void
 pfinder_reset(pfinder_t *pfinder) {
-	pfinder->base = 0;
-	pfinder->kslide = 0;
 	pfinder->data = NULL;
 	pfinder->kernel = NULL;
 	pfinder->kernel_sz = 0;
 	sec_reset(&pfinder->sec_text);
 	sec_reset(&pfinder->sec_cstring);
-	memset(&pfinder->cmd_symtab, '\0', sizeof(pfinder->cmd_symtab));
 }
 
 static void
 pfinder_term(pfinder_t *pfinder) {
 	free(pfinder->data);
+	sec_term(&pfinder->sec_text);
+	sec_term(&pfinder->sec_cstring);
 	pfinder_reset(pfinder);
 }
 
 static kern_return_t
-pfinder_init_file(pfinder_t *pfinder, const char *filename) {
-	struct symtab_command cmd_symtab;
-	kern_return_t ret = KERN_FAILURE;
+pfinder_init_macho(pfinder_t *pfinder, size_t off) {
+	const char *p = pfinder->kernel + off, *e;
+#if TARGET_OS_OSX
+	struct fileset_entry_command fec;
+#endif
 	struct segment_command_64 sg64;
 	struct mach_header_64 mh64;
 	struct load_command lc;
 	struct section_64 s64;
+
+	memcpy(&mh64, p, sizeof(mh64));
+	if(mh64.magic == MH_MAGIC_64 && mh64.cputype == CPU_TYPE_ARM64 &&
+#if TARGET_OS_OSX
+	   (mh64.filetype == MH_EXECUTE || (off == 0 && mh64.filetype == MH_FILESET))
+#else
+	   mh64.filetype == MH_EXECUTE
+#endif
+	   && mh64.sizeofcmds < (pfinder->kernel_sz - sizeof(mh64)) - off) {
+		for(p += sizeof(mh64), e = p + mh64.sizeofcmds; mh64.ncmds-- != 0 && (size_t)(e - p) >= sizeof(lc); p += lc.cmdsize) {
+			memcpy(&lc, p, sizeof(lc));
+			if(lc.cmdsize < sizeof(lc) || (size_t)(e - p) < lc.cmdsize) {
+				break;
+			}
+			if(lc.cmd == LC_SEGMENT_64) {
+				if(lc.cmdsize < sizeof(sg64)) {
+					break;
+				}
+				memcpy(&sg64, p, sizeof(sg64));
+				if(sg64.vmsize == 0) {
+					continue;
+				}
+				if(sg64.nsects != (lc.cmdsize - sizeof(sg64)) / sizeof(s64) || sg64.fileoff > pfinder->kernel_sz || sg64.filesize > pfinder->kernel_sz - sg64.fileoff) {
+					break;
+				}
+				if(mh64.filetype == MH_EXECUTE) {
+					if(strncmp(sg64.segname, SEG_TEXT_EXEC, sizeof(sg64.segname)) == 0) {
+						if(find_section_macho(p + sizeof(sg64), sg64, SECT_TEXT, &s64) != KERN_SUCCESS || s64.size == 0 || (pfinder->sec_text.data = malloc(s64.size)) == NULL) {
+							break;
+						}
+						memcpy(pfinder->sec_text.data, pfinder->kernel + s64.offset, s64.size);
+						pfinder->sec_text.s64 = s64;
+						printf("sec_text_addr: " KADDR_FMT ", sec_text_off: 0x%" PRIX32 ", sec_text_sz: 0x%" PRIX64 "\n", s64.addr, s64.offset, s64.size);
+					} else if(strncmp(sg64.segname, SEG_TEXT, sizeof(sg64.segname)) == 0) {
+						if(find_section_macho(p + sizeof(sg64), sg64, SECT_CSTRING, &s64) != KERN_SUCCESS || s64.size == 0 || (pfinder->sec_cstring.data = calloc(1, s64.size + 1)) == NULL) {
+							break;
+						}
+						memcpy(pfinder->sec_cstring.data, pfinder->kernel + s64.offset, s64.size);
+						pfinder->sec_cstring.s64 = s64;
+						printf("sec_cstring_addr: " KADDR_FMT ", sec_cstring_off: 0x%" PRIX32 ", sec_cstring_sz: 0x%" PRIX64 "\n", s64.addr, s64.offset, s64.size);
+					}
+				}
+			}
+#if TARGET_OS_OSX
+			else if(mh64.filetype == MH_FILESET && lc.cmd == LC_FILESET_ENTRY) {
+				if(lc.cmdsize < sizeof(fec)) {
+					break;
+				}
+				memcpy(&fec, p, sizeof(fec));
+				if(fec.fileoff == 0 || fec.fileoff > pfinder->kernel_sz - sizeof(mh64) || fec.entry_id.offset > fec.cmdsize || p[fec.cmdsize - 1] != '\0') {
+					break;
+				}
+				if(strcmp(p + fec.entry_id.offset, "com.apple.kernel") == 0 && pfinder_init_macho(pfinder, fec.fileoff) == KERN_SUCCESS) {
+					return KERN_SUCCESS;
+				}
+			}
+#endif
+			if(pfinder->sec_text.s64.size != 0 && pfinder->sec_cstring.s64.size != 0) {
+				pfinder->sec_text.s64.addr += kbase - vm_kernel_link_addr;
+				pfinder->sec_cstring.s64.addr += kbase - vm_kernel_link_addr;
+				return KERN_SUCCESS;
+			}
+		}
+	}
+	return KERN_FAILURE;
+}
+
+#if TARGET_OS_OSX
+static int
+kstrcmp(kaddr_t p, const char *s0) {
+	size_t len = strlen(s0);
+	int ret = 1;
+	char *s;
+
+	if((s = malloc(len + 1)) != NULL) {
+		s[len] = '\0';
+		if(kread_buf(p, s, len) == KERN_SUCCESS) {
+			ret = strcmp(s, s0);
+		}
+		free(s);
+	}
+	return ret;
+}
+#endif
+
+static kern_return_t
+pfinder_init_kernel(pfinder_t *pfinder, size_t off) {
+#if TARGET_OS_OSX
+	struct fileset_entry_command fec;
+#endif
+	struct segment_command_64 sg64;
+	kaddr_t p = kbase + off, e;
+	struct mach_header_64 mh64;
+	struct load_command lc;
+	struct section_64 s64;
+
+	if(kread_buf(p, &mh64, sizeof(mh64)) == KERN_SUCCESS && mh64.magic == MH_MAGIC_64 && mh64.cputype == CPU_TYPE_ARM64 &&
+#if TARGET_OS_OSX
+	   (mh64.filetype == MH_EXECUTE || (off == 0 && mh64.filetype == MH_FILESET))
+#else
+	   mh64.filetype == MH_EXECUTE
+#endif
+	   ) {
+		for(p += sizeof(mh64), e = p + mh64.sizeofcmds; mh64.ncmds-- != 0 && e - p >= sizeof(lc); p += lc.cmdsize) {
+			if(kread_buf(p, &lc, sizeof(lc)) != KERN_SUCCESS || lc.cmdsize < sizeof(lc) || e - p < lc.cmdsize) {
+				break;
+			}
+			if(lc.cmd == LC_SEGMENT_64) {
+				if(lc.cmdsize < sizeof(sg64) || kread_buf(p, &sg64, sizeof(sg64)) != KERN_SUCCESS) {
+					break;
+				}
+				if(sg64.vmsize == 0) {
+					continue;
+				}
+				if(sg64.nsects != (lc.cmdsize - sizeof(sg64)) / sizeof(s64)) {
+					break;
+				}
+				if(mh64.filetype == MH_EXECUTE) {
+					if(strncmp(sg64.segname, SEG_TEXT_EXEC, sizeof(sg64.segname)) == 0) {
+						if(find_section_kernel(p + sizeof(sg64), sg64, SECT_TEXT, &s64) != KERN_SUCCESS || s64.size == 0 || (pfinder->sec_text.data = malloc(s64.size)) == NULL || kread_buf(s64.addr, pfinder->sec_text.data, s64.size) != KERN_SUCCESS) {
+							break;
+						}
+						pfinder->sec_text.s64 = s64;
+						printf("sec_text_addr: " KADDR_FMT ", sec_text_off: 0x%" PRIX32 ", sec_text_sz: 0x%" PRIX64 "\n", s64.addr, s64.offset, s64.size);
+					} else if(strncmp(sg64.segname, SEG_TEXT, sizeof(sg64.segname)) == 0) {
+						if(find_section_kernel(p + sizeof(sg64), sg64, SECT_CSTRING, &s64) != KERN_SUCCESS || s64.size == 0 || (pfinder->sec_cstring.data = calloc(1, s64.size + 1)) == NULL || kread_buf(s64.addr, pfinder->sec_cstring.data, s64.size) != KERN_SUCCESS) {
+							break;
+						}
+						pfinder->sec_cstring.s64 = s64;
+						printf("sec_cstring_addr: " KADDR_FMT ", sec_cstring_off: 0x%" PRIX32 ", sec_cstring_sz: 0x%" PRIX64 "\n", s64.addr, s64.offset, s64.size);
+					}
+				}
+			}
+#if TARGET_OS_OSX
+			else if(mh64.filetype == MH_FILESET && lc.cmd == LC_FILESET_ENTRY) {
+				if(lc.cmdsize < sizeof(fec) || kread_buf(p, &fec, sizeof(fec)) != KERN_SUCCESS) {
+					break;
+				}
+				if(fec.fileoff == 0 || fec.entry_id.offset > fec.cmdsize) {
+					break;
+				}
+				if(kstrcmp(p + fec.entry_id.offset, "com.apple.kernel") == 0 && pfinder_init_kernel(pfinder, fec.fileoff) == KERN_SUCCESS) {
+					return KERN_SUCCESS;
+				}
+			}
+#endif
+			if(pfinder->sec_text.s64.size != 0 && pfinder->sec_cstring.s64.size != 0) {
+				return KERN_SUCCESS;
+			}
+		}
+	}
+	return KERN_FAILURE;
+}
+
+static kern_return_t
+pfinder_init_file(pfinder_t *pfinder, const char *filename) {
+	kern_return_t ret = KERN_FAILURE;
+	struct mach_header_64 mh64;
 	struct fat_header fh;
 	struct stat stat_buf;
 	struct fat_arch fa;
-	const char *p, *e;
+	const char *p;
 	size_t len;
 	void *m;
 	int fd;
@@ -358,63 +681,7 @@ pfinder_init_file(pfinder_t *pfinder, const char *filename) {
 							}
 						}
 					}
-					memcpy(&mh64, pfinder->kernel, sizeof(mh64));
-					if(mh64.magic == MH_MAGIC_64 && mh64.cputype == CPU_TYPE_ARM64 && mh64.filetype == MH_EXECUTE && mh64.sizeofcmds < pfinder->kernel_sz - sizeof(mh64)) {
-						for(p = pfinder->kernel + sizeof(mh64), e = p + mh64.sizeofcmds; mh64.ncmds-- != 0 && (size_t)(e - p) >= sizeof(lc); p += lc.cmdsize) {
-							memcpy(&lc, p, sizeof(lc));
-							if(lc.cmdsize < sizeof(lc) || (size_t)(e - p) < lc.cmdsize) {
-								break;
-							}
-							if(lc.cmd == LC_SEGMENT_64) {
-								if(lc.cmdsize < sizeof(sg64)) {
-									break;
-								}
-								memcpy(&sg64, p, sizeof(sg64));
-								if(sg64.vmsize == 0) {
-									continue;
-								}
-								if(sg64.nsects != (lc.cmdsize - sizeof(sg64)) / sizeof(s64) || sg64.fileoff > pfinder->kernel_sz || sg64.filesize > pfinder->kernel_sz - sg64.fileoff) {
-									break;
-								}
-								if(sg64.fileoff == 0 && sg64.filesize != 0) {
-									if(pfinder->base != 0) {
-										break;
-									}
-									pfinder->base = sg64.vmaddr;
-									KERNINFRA_LOG(KERNLOG_INIT, "base: " KADDR_FMT "\n", sg64.vmaddr);
-								}
-								if(strncmp(sg64.segname, SEG_TEXT_EXEC, sizeof(sg64.segname)) == 0) {
-									if(find_section(p + sizeof(sg64), sg64, SECT_TEXT, &s64) != KERN_SUCCESS) {
-										break;
-									}
-									pfinder->sec_text.s64 = s64;
-									pfinder->sec_text.data = pfinder->kernel + s64.offset;
-									KERNINFRA_LOG(KERNLOG_INIT, "sec_text_addr: " KADDR_FMT ", sec_text_off: 0x%" PRIX32 ", sec_text_sz: 0x%" PRIX64 "\n", s64.addr, s64.offset, s64.size);
-								} else if(strncmp(sg64.segname, SEG_TEXT, sizeof(sg64.segname)) == 0) {
-									if(find_section(p + sizeof(sg64), sg64, SECT_CSTRING, &s64) != KERN_SUCCESS || pfinder->kernel[s64.offset + s64.size - 1] != '\0') {
-										break;
-									}
-									pfinder->sec_cstring.s64 = s64;
-									pfinder->sec_cstring.data = pfinder->kernel + s64.offset;
-									KERNINFRA_LOG(KERNLOG_INIT, "sec_cstring_addr: " KADDR_FMT ", sec_cstring_off: 0x%" PRIX32 ", sec_cstring_sz: 0x%" PRIX64 "\n", s64.addr, s64.offset, s64.size);
-								}
-							} else if(lc.cmd == LC_SYMTAB) {
-								if(lc.cmdsize != sizeof(cmd_symtab)) {
-									break;
-								}
-								memcpy(&cmd_symtab, p, sizeof(cmd_symtab));
-								KERNINFRA_LOG(KERNLOG_INIT, "cmd_symtab_symoff: 0x%" PRIX32 ", cmd_symtab_nsyms: 0x%" PRIX32 ", cmd_symtab_stroff: 0x%" PRIX32 "\n", cmd_symtab.symoff, cmd_symtab.nsyms, cmd_symtab.stroff);
-								if(cmd_symtab.nsyms != 0 && (cmd_symtab.symoff > pfinder->kernel_sz || cmd_symtab.nsyms > (pfinder->kernel_sz - cmd_symtab.symoff) / sizeof(struct nlist_64) || cmd_symtab.stroff > pfinder->kernel_sz || cmd_symtab.strsize > pfinder->kernel_sz - cmd_symtab.stroff || cmd_symtab.strsize == 0 || pfinder->kernel[cmd_symtab.stroff + cmd_symtab.strsize - 1] != '\0')) {
-									break;
-								}
-								pfinder->cmd_symtab = cmd_symtab;
-							}
-							if(pfinder->base != 0 && pfinder->sec_text.s64.size != 0 && pfinder->sec_cstring.s64.size != 0 && pfinder->cmd_symtab.cmdsize != 0) {
-								ret = KERN_SUCCESS;
-								break;
-							}
-						}
-					}
+					ret = pfinder_init_macho(pfinder, 0);
 				}
 				munmap(m, len);
 			}
@@ -422,6 +689,78 @@ pfinder_init_file(pfinder_t *pfinder, const char *filename) {
 		close(fd);
 	}
 	if(ret != KERN_SUCCESS) {
+		pfinder_term(pfinder);
+	}
+	return ret;
+}
+
+static char *
+get_boot_path(void) {
+	size_t path_len = sizeof(BOOT_PATH);
+#if TARGET_OS_OSX
+	CFDataRef boot_objects_path_cf;
+	size_t boot_objects_path_len;
+#else
+	const uint8_t *hash;
+	CFDataRef hash_cf;
+	size_t hash_len;
+#endif
+	io_registry_entry_t chosen;
+	struct stat stat_buf;
+	char *path = NULL;
+
+	if(stat(PREBOOT_PATH, &stat_buf) != -1 && S_ISDIR(stat_buf.st_mode)) {
+		if((chosen = IORegistryEntryFromPath(kIOMasterPortDefault, kIODeviceTreePlane ":/chosen")) != IO_OBJECT_NULL) {
+			path_len += strlen(PREBOOT_PATH);
+#if TARGET_OS_OSX
+			if((boot_objects_path_cf = IORegistryEntryCreateCFProperty(chosen, CFSTR("boot-objects-path"), kCFAllocatorDefault, kNilOptions)) != NULL) {
+				if(CFGetTypeID(boot_objects_path_cf) == CFDataGetTypeID() && (boot_objects_path_len = (size_t)CFDataGetLength(boot_objects_path_cf) - 1) != 0) {
+					path_len += boot_objects_path_len;
+					if((path = malloc(path_len)) != NULL) {
+						memcpy(path, PREBOOT_PATH, strlen(PREBOOT_PATH));
+						memcpy(path + strlen(PREBOOT_PATH), CFDataGetBytePtr(boot_objects_path_cf), boot_objects_path_len);
+					}
+				}
+				CFRelease(boot_objects_path_cf);
+			}
+#else
+			if((hash_cf = IORegistryEntryCreateCFProperty(chosen, CFSTR("boot-manifest-hash"), kCFAllocatorDefault, kNilOptions)) != NULL) {
+				if(CFGetTypeID(hash_cf) == CFDataGetTypeID() && (hash_len = (size_t)CFDataGetLength(hash_cf) << 1U) != 0) {
+					path_len += hash_len;
+					if((path = malloc(path_len)) != NULL) {
+						memcpy(path, PREBOOT_PATH, strlen(PREBOOT_PATH));
+						for(hash = CFDataGetBytePtr(hash_cf); hash_len-- != 0; ) {
+							path[strlen(PREBOOT_PATH) + hash_len] = "0123456789ABCDEF"[(hash[hash_len >> 1U] >> ((~hash_len & 1U) << 2U)) & 0xFU];
+						}
+					}
+				}
+				CFRelease(hash_cf);
+			}
+#endif
+			IOObjectRelease(chosen);
+		}
+	} else if(stat(BOOT_PATH, &stat_buf) != -1 && S_ISREG(stat_buf.st_mode)) {
+		path = malloc(path_len);
+	}
+	if(path != NULL) {
+		memcpy(path + (path_len - sizeof(BOOT_PATH)), BOOT_PATH, sizeof(BOOT_PATH));
+	}
+	return path;
+}
+
+static kern_return_t
+pfinder_init(pfinder_t *pfinder) {
+	char *boot_path = get_boot_path();
+	kern_return_t ret = KERN_FAILURE;
+
+	pfinder_reset(pfinder);
+	if(boot_path != NULL) {
+		printf("boot_path: %s\n", boot_path);
+		if((ret = pfinder_init_file(pfinder, boot_path)) != KERN_SUCCESS && (ret = pfinder_init_kernel(pfinder, 0)) != KERN_SUCCESS) {
+			pfinder_term(pfinder);
+		}
+		free(boot_path);
+	} else if((ret = pfinder_init_kernel(pfinder, 0)) != KERN_SUCCESS) {
 		pfinder_term(pfinder);
 	}
 	return ret;
@@ -451,9 +790,6 @@ pfinder_xref_rd(pfinder_t pfinder, uint32_t rd, kaddr_t start, kaddr_t to) {
 		}
 		if(RD(insn) == rd) {
 			if(to == 0) {
-				if(x[rd] < pfinder.base) {
-					break;
-				}
 				return x[rd];
 			}
 			if(x[rd] == to) {
@@ -479,36 +815,6 @@ pfinder_xref_str(pfinder_t pfinder, const char *str, uint32_t rd) {
 }
 
 static kaddr_t
-pfinder_sym(pfinder_t pfinder, const char *sym) {
-	const char *p, *strtab = pfinder.kernel + pfinder.cmd_symtab.stroff;
-	struct nlist_64 nl64;
-
-	for(p = pfinder.kernel + pfinder.cmd_symtab.symoff; pfinder.cmd_symtab.nsyms-- != 0; p += sizeof(nl64)) {
-		memcpy(&nl64, p, sizeof(nl64));
-		if(nl64.n_un.n_strx != 0 && nl64.n_un.n_strx < pfinder.cmd_symtab.strsize && (nl64.n_type & (N_STAB | N_TYPE)) == N_SECT && nl64.n_value >= pfinder.base && strcmp(strtab + nl64.n_un.n_strx, sym) == 0) {
-			return nl64.n_value + pfinder.kslide;
-		}
-	}
-	return 0;
-}
-
-static kaddr_t
-pfinder_kernproc(pfinder_t pfinder) {
-	kaddr_t ref = pfinder_sym(pfinder, "_kernproc");
-	uint32_t insns[2];
-
-	if(ref != 0) {
-		return ref;
-	}
-	for(ref = pfinder_xref_str(pfinder, "\"Should never have an EVFILT_READ except for reg or fifo.\"", 0); sec_read_buf(pfinder.sec_text, ref, insns, sizeof(insns)) == KERN_SUCCESS; ref -= sizeof(*insns)) {
-		if(IS_ADRP(insns[0]) && IS_LDR_X_UNSIGNED_IMM(insns[1]) && RD(insns[1]) == 3) {
-			return pfinder_xref_rd(pfinder, RD(insns[1]), ref, 0);
-		}
-	}
-	return 0;
-}
-
-static kaddr_t
 pfinder_allproc(pfinder_t pfinder) {
 	kaddr_t ref = pfinder_xref_str(pfinder, "shutdownwait", 2);
 
@@ -519,100 +825,605 @@ pfinder_allproc(pfinder_t pfinder) {
 }
 
 static kaddr_t
-pfinder_init_kbase(pfinder_t *pfinder) {
-	struct mach_header_64 mh64;
+pfinder_kernproc(pfinder_t pfinder) {
+	kaddr_t ref = pfinder_xref_str(pfinder, "Should never have an EVFILT_READ except for reg or fifo. @%s:%d", 0);
+	uint32_t insns[2];
 
-	if(pfinder->base + pfinder->kslide > pfinder->base && kread_buf(pfinder->base + pfinder->kslide, &mh64, sizeof(mh64)) == KERN_SUCCESS && mh64.magic == MH_MAGIC_64 && mh64.cputype == CPU_TYPE_ARM64 && mh64.filetype == MH_EXECUTE) {
-		pfinder->sec_text.s64.addr += pfinder->kslide;
-		pfinder->sec_cstring.s64.addr += pfinder->kslide;
-		KERNINFRA_LOG(KERNLOG_INIT, "kbase: " KADDR_FMT ", kslide: " KADDR_FMT "\n", pfinder->base + pfinder->kslide, pfinder->kslide);
-		p_kbase = pfinder->base + pfinder->kslide;
-		p_kslide = pfinder->kslide;
+	if(ref == 0) {
+		ref = pfinder_xref_str(pfinder, "\"Should never have an EVFILT_READ except for reg or fifo.\"", 0);
+	}
+	for(; sec_read_buf(pfinder.sec_text, ref, insns, sizeof(insns)) == KERN_SUCCESS; ref -= sizeof(*insns)) {
+		if(IS_ADRP(insns[0]) && IS_LDR_X_UNSIGNED_IMM(insns[1]) && RD(insns[1]) == 3) {
+			return pfinder_xref_rd(pfinder, RD(insns[1]), ref, 0);
+		}
+	}
+	return 0;
+}
+
+static kaddr_t
+pfinder_proc_struct_sz_ptr(pfinder_t pfinder) {
+	uint32_t insns[3];
+	kaddr_t ref;
+
+	for(ref = pfinder_xref_str(pfinder, "panic: ticket lock acquired check done outside of kernel debugger @%s:%d", 0); sec_read_buf(pfinder.sec_text, ref, insns, sizeof(insns)) == KERN_SUCCESS; ref -= sizeof(*insns)) {
+		if(IS_ADRP(insns[0]) && IS_LDR_X_UNSIGNED_IMM(insns[1]) && IS_SUBS_X(insns[2]) && RD(insns[2]) == 1) {
+			return pfinder_xref_rd(pfinder, RD(insns[1]), ref, 0);
+		}
+	}
+	return 0;
+}
+
+static kern_return_t
+init_kbase(void) {
+	struct {
+		uint32_t pri_prot, pri_max_prot, pri_inheritance, pri_flags;
+		uint64_t pri_offset;
+		uint32_t pri_behavior, pri_user_wired_cnt, pri_user_tag, pri_pages_resident, pri_pages_shared_now_private, pri_pages_swapped_out, pri_pages_dirtied, pri_ref_cnt, pri_shadow_depth, pri_share_mode, pri_private_pages_resident, pri_shared_pages_resident, pri_obj_id, pri_depth;
+		kaddr_t pri_addr;
+		uint64_t pri_sz;
+	} pri;
+	mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
+	CFDictionaryRef kexts_info, kext_info;
+	kernrw_0_kbase_func_t kernrw_0_kbase;
+	kaddr_t kext_addr, kext_addr_slid;
+	task_dyld_info_data_t dyld_info;
+	krw_0_kbase_func_t krw_0_kbase;
+	char kext_name[KMOD_MAX_NAME];
+	struct mach_header_64 mh64;
+	CFStringRef kext_name_cf;
+	CFNumberRef kext_addr_cf;
+	CFArrayRef kext_names;
+
+	if(kbase == 0) {
+		if((((kernrw_0 == NULL || (kernrw_0_kbase = (kernrw_0_kbase_func_t)dlsym(kernrw_0, "kernRW_getKernelBase")) == NULL || kernrw_0_kbase(&kbase) != KERN_SUCCESS)) && (krw_0 == NULL || (krw_0_kbase = (krw_0_kbase_func_t)dlsym(krw_0, "kbase")) == NULL || krw_0_kbase(&kbase) != 0)) || tfp0 == TASK_NULL || task_info(tfp0, TASK_DYLD_INFO, (task_info_t)&dyld_info, &cnt) != KERN_SUCCESS || (kbase = vm_kernel_link_addr + dyld_info.all_image_info_size) == 0) {
+			for(pri.pri_addr = 0; proc_pidinfo(0, PROC_PIDREGIONINFO, pri.pri_addr, &pri, sizeof(pri)) == sizeof(pri); pri.pri_addr += pri.pri_sz) {
+				if(pri.pri_prot == VM_PROT_READ && pri.pri_user_tag == VM_KERN_MEMORY_OSKEXT) {
+					if(kread_buf(pri.pri_addr + LOADED_KEXT_SUMMARY_HDR_NAME_OFF, kext_name, sizeof(kext_name)) == KERN_SUCCESS) {
+						printf("kext_name: %s\n", kext_name);
+						if(kread_addr(pri.pri_addr + LOADED_KEXT_SUMMARY_HDR_ADDR_OFF, &kext_addr_slid) == KERN_SUCCESS) {
+							printf("kext_addr_slid: " KADDR_FMT "\n", kext_addr_slid);
+							if((kext_name_cf = CFStringCreateWithCStringNoCopy(kCFAllocatorDefault, kext_name, kCFStringEncodingUTF8, kCFAllocatorNull)) != NULL) {
+								if((kext_names = CFArrayCreate(kCFAllocatorDefault, (const void **)&kext_name_cf, 1, &kCFTypeArrayCallBacks)) != NULL) {
+									if((kexts_info = OSKextCopyLoadedKextInfo(kext_names, NULL)) != NULL) {
+										if(CFGetTypeID(kexts_info) == CFDictionaryGetTypeID() && CFDictionaryGetCount(kexts_info) == 1 && (kext_info = CFDictionaryGetValue(kexts_info, kext_name_cf)) != NULL && CFGetTypeID(kext_info) == CFDictionaryGetTypeID() && (kext_addr_cf = CFDictionaryGetValue(kext_info, CFSTR(kOSBundleLoadAddressKey))) != NULL && CFGetTypeID(kext_addr_cf) == CFNumberGetTypeID() && CFNumberGetValue(kext_addr_cf, kCFNumberSInt64Type, &kext_addr) && kext_addr_slid > kext_addr) {
+											kbase = vm_kernel_link_addr + (kext_addr_slid - kext_addr);
+										}
+										CFRelease(kexts_info);
+									}
+									CFRelease(kext_names);
+								}
+								CFRelease(kext_name_cf);
+							}
+						}
+					}
+					break;
+				}
+			}
+		}
+	}
+	if(kread_buf(kbase, &mh64, sizeof(mh64)) == KERN_SUCCESS && mh64.magic == MH_MAGIC_64 && mh64.cputype == CPU_TYPE_ARM64 && mh64.filetype ==
+#if TARGET_OS_OSX
+	   MH_FILESET
+#else
+	   MH_EXECUTE
+#endif
+	   ) {
+		printf("kbase: " KADDR_FMT "\n", kbase);
+		p_kbase=kbase; 
 		return KERN_SUCCESS;
 	}
 	return KERN_FAILURE;
 }
 
-static char *
-get_boot_path(void) {
-	size_t hash_len, path_len = sizeof(BOOT_PATH);
-	io_registry_entry_t chosen;
-	struct stat stat_buf;
-	const uint8_t *hash;
-	CFDataRef hash_cf;
-	char *path = NULL;
+static kern_return_t
+pfinder_init_offsets(void) {
+	kern_return_t ret = KERN_FAILURE;
+	struct utsname uts;
+	CFStringRef cf_str;
+	pfinder_t pfinder;
+	char *p, *e;
 
-	if(stat(PREBOOT_PATH, &stat_buf) != -1 && S_ISDIR(stat_buf.st_mode) && (chosen = IORegistryEntryFromPath(kIOMasterPortDefault, kIODeviceTreePlane ":/chosen")) != IO_OBJECT_NULL) {
-		if((hash_cf = IORegistryEntryCreateCFProperty(chosen, CFSTR("boot-manifest-hash"), kCFAllocatorDefault, kNilOptions)) != NULL) {
-			if(CFGetTypeID(hash_cf) == CFDataGetTypeID() && (hash_len = (size_t)CFDataGetLength(hash_cf) << 1U) != 0) {
-				path_len += strlen(PREBOOT_PATH) + hash_len;
-				if((path = malloc(path_len)) != NULL) {
-					memcpy(path, PREBOOT_PATH, strlen(PREBOOT_PATH));
-					for(hash = CFDataGetBytePtr(hash_cf); hash_len-- != 0; ) {
-						path[strlen(PREBOOT_PATH) + hash_len] = "0123456789ABCDEF"[(hash[hash_len >> 1U] >> ((~hash_len & 1U) << 2U)) & 0xFU];
+	if(uname(&uts) == 0 && (p = strstr(uts.version, "root:xnu-")) != NULL && (e = strchr(p += strlen("root:xnu-"), '~')) != NULL) {
+		*e = '\0';
+		if((cf_str = CFStringCreateWithCStringNoCopy(kCFAllocatorDefault, p, kCFStringEncodingASCII, kCFAllocatorNull)) != NULL) {
+			proc_task_off = 0x18;
+			proc_p_pid_off = 0x10;
+			task_itk_space_off = 0x290;
+			io_dt_nvram_of_dict_off = 0xC0;
+			ipc_port_ip_kobject_off = 0x68;
+#if TARGET_OS_OSX
+			vm_kernel_link_addr = 0xFFFFFE0007004000ULL;
+#else
+			vm_kernel_link_addr = 0xFFFFFFF007004000ULL;
+#endif
+			if(CFStringCompare(cf_str, CFSTR("3789.1.24"), kCFCompareNumerically) != kCFCompareLessThan) {
+				task_itk_space_off = 0x300;
+				if(CFStringCompare(cf_str, CFSTR("4397.0.0.2.4"), kCFCompareNumerically) != kCFCompareLessThan) {
+					task_itk_space_off = 0x308;
+					if(CFStringCompare(cf_str, CFSTR("4903.200.199.12.3"), kCFCompareNumerically) != kCFCompareLessThan) {
+						proc_task_off = 0x10;
+						proc_p_pid_off = 0x60;
+						task_itk_space_off = 0x300;
+						if(CFStringCompare(cf_str, CFSTR("6041.0.0.110.11"), kCFCompareNumerically) != kCFCompareLessThan) {
+							task_itk_space_off = 0x320;
+							if(CFStringCompare(cf_str, CFSTR("6110.0.0.120.8"), kCFCompareNumerically) != kCFCompareLessThan) {
+								proc_p_pid_off = 0x68;
+								if(CFStringCompare(cf_str, CFSTR("7090.0.0.110.4"), kCFCompareNumerically) != kCFCompareLessThan) {
+									task_itk_space_off = 0x330;
+									io_dt_nvram_of_dict_off = 0xB8;
+									if(CFStringCompare(cf_str, CFSTR("7195.50.3.201.1"), kCFCompareNumerically) != kCFCompareLessThan) {
+#if TARGET_OS_OSX
+										io_dt_nvram_of_dict_off = 0xE0;
+#else
+										io_dt_nvram_of_dict_off = 0xC0;
+#endif
+										if(CFStringCompare(cf_str, CFSTR("7195.60.69"), kCFCompareNumerically) != kCFCompareLessThan) {
+#if TARGET_OS_OSX
+											io_dt_nvram_of_dict_off = 0xE8;
+#else
+											io_dt_nvram_of_dict_off = 0xC8;
+#endif
+											if(CFStringCompare(cf_str, CFSTR("7195.100.296.111.3"), kCFCompareNumerically) != kCFCompareLessThan) {
+												task_itk_space_off = 0x340;
+												if(CFStringCompare(cf_str, CFSTR("7195.100.326.0.1"), kCFCompareNumerically) != kCFCompareLessThan) {
+													task_itk_space_off = 0x338;
+													if(CFStringCompare(cf_str, CFSTR("7938.0.0.111.2"), kCFCompareNumerically) != kCFCompareLessThan) {
+														task_itk_space_off = 0x330;
+														ipc_port_ip_kobject_off = 0x58;
+														if(CFStringCompare(cf_str, CFSTR("8019.0.46.0.4"), kCFCompareNumerically) != kCFCompareLessThan) {
+#if TARGET_OS_OSX
+															io_dt_nvram_of_dict_off = 0xF0;
+#else
+															io_dt_nvram_of_dict_off = 0xE8;
+#endif
+															if(CFStringCompare(cf_str, CFSTR("8019.60.40.0.1"), kCFCompareNumerically) != kCFCompareLessThan) {
+																task_itk_space_off = 0x308;
+																if(CFStringCompare(cf_str, CFSTR("8020.100.406.0.1"), kCFCompareNumerically) != kCFCompareLessThan) {
+#if TARGET_OS_OSX
+																	io_dt_nvram_of_dict_off = 0xC0;
+#else
+																	io_dt_nvram_of_dict_off = 0xB8;
+#endif
+																	ipc_port_ip_kobject_off = 0x48;
+																	if(CFStringCompare(cf_str, CFSTR("8792.0.50.111.3"), kCFCompareNumerically) != kCFCompareLessThan) {
+																		proc_p_pid_off = 0x60;
+																		has_proc_struct_sz = true;
+																		task_itk_space_off = 0x300;
+																		if(CFStringCompare(cf_str, CFSTR("8792.40.101.0.1"), kCFCompareNumerically) != kCFCompareLessThan) {
+#if TARGET_OS_OSX
+																			io_dt_nvram_of_dict_off = 0xC8;
+#else
+																			io_dt_nvram_of_dict_off = 0xC0;
+#endif
+																			has_kalloc_array_decode = true;
+																			if(CFStringCompare(cf_str, CFSTR("8792.80.25.121.4"), kCFCompareNumerically) != kCFCompareLessThan) {
+																				kalloc_array_decode_v2 = true;
+																			}
+																		}
+																	}
+																}
+															}
+														}
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
 					}
 				}
 			}
-			CFRelease(hash_cf);
+			CFRelease(cf_str);
+			if(init_kbase() == KERN_SUCCESS && pfinder_init(&pfinder) == KERN_SUCCESS) {
+				if((kernproc = pfinder_kernproc(pfinder)) != 0) {
+					printf("kernproc: " KADDR_FMT "\n", kernproc);
+					if((allproc = pfinder_allproc(pfinder)) != 0) {
+						KERNINFRA_LOG(KERNLOG_INIT, "allproc: " KADDR_FMT "\n", allproc);
+						ret = KERN_SUCCESS;
+					}
+					if(!has_proc_struct_sz) {
+						ret = KERN_SUCCESS;
+					} else if((proc_struct_sz_ptr = pfinder_proc_struct_sz_ptr(pfinder)) != 0) {
+						printf("proc_struct_sz_ptr: " KADDR_FMT "\n", proc_struct_sz_ptr);
+						ret = KERN_SUCCESS;
+					}
+				}
+				pfinder_term(&pfinder);
+			}
+		}
+	}
+	return ret;
+}
+
+static kern_return_t
+find_task(pid_t pid, kaddr_t *task) {
+	pid_t cur_pid;
+	kaddr_t proc;
+
+	if(kread_addr(kernproc + PROC_P_LIST_LH_FIRST_OFF, &proc) == KERN_SUCCESS) {
+		while(proc != 0 && kread_buf(proc + proc_p_pid_off, &cur_pid, sizeof(cur_pid)) == KERN_SUCCESS) {
+			if(cur_pid == pid) {
+				if(has_proc_struct_sz) {
+					*task = proc + proc_struct_sz;
+					return KERN_SUCCESS;
+				}
+				return kread_addr(proc + proc_task_off, task);
+			}
+			if(pid == 0 || kread_addr(proc + PROC_P_LIST_LE_PREV_OFF, &proc) != KERN_SUCCESS) {
+				break;
+			}
+		}
+	}
+	return KERN_FAILURE;
+}
+
+static void
+kalloc_array_decode(kaddr_t *addr) {
+	unsigned kalloc_array_type_shift;
+
+	if(has_kalloc_array_decode) {
+		if(t1sz_boot != 0) {
+			if(kalloc_array_decode_v2) {
+				kalloc_array_type_shift = 63 - t1sz_boot;
+				if(((*addr >> kalloc_array_type_shift) & 1U) != 0) {
+					*addr &= ~0x1FULL;
+				} else {
+					*addr &= ~((1U << ARM_PGSHIFT_16K) - 1U);
+					*addr |= 1ULL << kalloc_array_type_shift;
+				}
+			} else {
+				kalloc_array_type_shift = 62 - t1sz_boot;
+				if(((*addr >> kalloc_array_type_shift) & 3U) != 0) {
+					*addr &= ~0xFULL;
+				} else {
+					*addr &= ~((1U << ARM_PGSHIFT_16K) - 1U);
+					*addr |= 3ULL << kalloc_array_type_shift;
+				}
+			}
+		} else {
+			*addr |= ~((1ULL << KALLOC_ARRAY_TYPE_BIT) - 1U);
+		}
+	}
+}
+
+static kern_return_t
+lookup_ipc_port(mach_port_name_t port_name, kaddr_t *ipc_port) {
+	kaddr_t itk_space, is_table;
+
+	if(MACH_PORT_VALID(port_name) && kread_addr(our_task + task_itk_space_off, &itk_space) == KERN_SUCCESS) {
+		kxpacd(&itk_space);
+		printf("itk_space: " KADDR_FMT "\n", itk_space);
+		if(kread_addr(itk_space + IPC_SPACE_IS_TABLE_OFF, &is_table) == KERN_SUCCESS) {
+			kxpacd(&is_table);
+			kalloc_array_decode(&is_table);
+			printf("is_table: " KADDR_FMT "\n", is_table);
+			return kread_addr(is_table + MACH_PORT_INDEX(port_name) * IPC_ENTRY_SZ + IPC_ENTRY_IE_OBJECT_OFF, ipc_port);
+		}
+	}
+	return KERN_FAILURE;
+}
+
+static kern_return_t
+lookup_io_object(io_object_t object, kaddr_t *ip_kobject) {
+	kaddr_t ipc_port;
+
+	if(lookup_ipc_port(object, &ipc_port) == KERN_SUCCESS) {
+		kxpacd(&ipc_port);
+		printf("ipc_port: " KADDR_FMT "\n", ipc_port);
+		return kread_addr(ipc_port + ipc_port_ip_kobject_off, ip_kobject);
+	}
+	return KERN_FAILURE;
+}
+
+static kern_return_t
+nonce_generate(void) {
+	io_service_t nonce_serv = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("AppleMobileApNonce"));
+	uint8_t nonce_d[CC_SHA384_DIGEST_LENGTH];
+	kern_return_t ret = KERN_FAILURE;
+	io_connect_t nonce_conn;
+	size_t nonce_d_sz;
+
+	if(nonce_serv != IO_OBJECT_NULL) {
+		printf("nonce_serv: 0x%" PRIX32 "\n", nonce_serv);
+		if(IOServiceOpen(nonce_serv, mach_task_self(), 0, &nonce_conn) == KERN_SUCCESS) {
+			printf("nonce_conn: 0x%" PRIX32 "\n", nonce_conn);
+			if(IOConnectCallStructMethod(nonce_conn, APPLE_MOBILE_AP_NONCE_CLEAR_NONCE_SEL, NULL, 0, NULL, NULL) == KERN_SUCCESS) {
+				nonce_d_sz = sizeof(nonce_d);
+				ret = IOConnectCallStructMethod(nonce_conn, APPLE_MOBILE_AP_NONCE_GENERATE_NONCE_SEL, NULL, 0, nonce_d, &nonce_d_sz);
+			}
+			IOServiceClose(nonce_conn);
+		} else {
+			puts("Please use \"ideviceinfo -k ApNonce\" to generate nonce.");
+			ret = KERN_SUCCESS;
+		}
+		IOObjectRelease(nonce_serv);
+	}
+	return ret;
+}
+
+static kern_return_t
+get_of_dict(io_registry_entry_t nvram_entry, kaddr_t *of_dict) {
+	kaddr_t nvram_object;
+
+	if(lookup_io_object(nvram_entry, &nvram_object) == KERN_SUCCESS) {
+		kxpacd(&nvram_object);
+		printf("nvram_object: " KADDR_FMT "\n", nvram_object);
+		return kread_addr(nvram_object + io_dt_nvram_of_dict_off, of_dict);
+	}
+	return KERN_FAILURE;
+}
+
+static kaddr_t
+lookup_key_in_os_dict(kaddr_t os_dict, const char *key) {
+	kaddr_t os_dict_entry_ptr, string_ptr, val = 0;
+	uint32_t os_dict_cnt, cur_key_len;
+	size_t key_len = strlen(key) + 1;
+	struct {
+		kaddr_t key, val;
+	} os_dict_entry;
+	char *cur_key;
+
+	if((cur_key = malloc(key_len)) != NULL) {
+		if(kread_addr(os_dict + OS_DICTIONARY_DICT_ENTRY_OFF, &os_dict_entry_ptr) == KERN_SUCCESS) {
+			kxpacd(&os_dict_entry_ptr);
+			printf("os_dict_entry_ptr: " KADDR_FMT "\n", os_dict_entry_ptr);
+			if(kread_buf(os_dict + OS_DICTIONARY_COUNT_OFF, &os_dict_cnt, sizeof(os_dict_cnt)) == KERN_SUCCESS) {
+				printf("os_dict_cnt: 0x%" PRIX32 "\n", os_dict_cnt);
+				while(os_dict_cnt-- != 0 && kread_buf(os_dict_entry_ptr + os_dict_cnt * sizeof(os_dict_entry), &os_dict_entry, sizeof(os_dict_entry)) == KERN_SUCCESS) {
+					printf("key: " KADDR_FMT ", val: " KADDR_FMT "\n", os_dict_entry.key, os_dict_entry.val);
+					if(kread_buf(os_dict_entry.key + OS_STRING_LEN_OFF, &cur_key_len, sizeof(cur_key_len)) != KERN_SUCCESS) {
+						break;
+					}
+					cur_key_len = OS_STRING_LEN(cur_key_len);
+					printf("cur_key_len: 0x%" PRIX32 "\n", cur_key_len);
+					if(cur_key_len == key_len) {
+						if(kread_addr(os_dict_entry.key + OS_STRING_STRING_OFF, &string_ptr) != KERN_SUCCESS) {
+							break;
+						}
+						kxpacd(&string_ptr);
+						printf("string_ptr: " KADDR_FMT "\n", string_ptr);
+						if(kread_buf(string_ptr, cur_key, key_len) != KERN_SUCCESS) {
+							break;
+						}
+						if(memcmp(cur_key, key, key_len) == 0) {
+							val = os_dict_entry.val;
+							break;
+						}
+					}
+				}
+			}
+		}
+		free(cur_key);
+	}
+	return val;
+}
+
+static kern_return_t
+get_nvram_prop(io_registry_entry_t nvram_entry, const char *key, char *val, CFIndex val_sz) {
+	CFStringRef cf_key = CFStringCreateWithCStringNoCopy(kCFAllocatorDefault, key, kCFStringEncodingUTF8, kCFAllocatorNull), cf_val;
+	kern_return_t ret = KERN_FAILURE;
+
+	if(cf_key != NULL) {
+		if((cf_val = IORegistryEntryCreateCFProperty(nvram_entry, cf_key, kCFAllocatorDefault, kNilOptions)) != NULL) {
+			if(CFGetTypeID(cf_val) == CFStringGetTypeID() && CFStringGetCString(cf_val, val, val_sz, kCFStringEncodingUTF8)) {
+				ret = KERN_SUCCESS;
+			}
+			CFRelease(cf_val);
+		}
+		CFRelease(cf_key);
+	}
+	return ret;
+}
+
+static kern_return_t
+set_nvram_prop(io_registry_entry_t nvram_entry, const char *key, const char *val) {
+	CFStringRef cf_key = CFStringCreateWithCStringNoCopy(kCFAllocatorDefault, key, kCFStringEncodingUTF8, kCFAllocatorNull), cf_val;
+	kern_return_t ret = KERN_FAILURE;
+
+	if(cf_key != NULL) {
+		if((cf_val = CFStringCreateWithCStringNoCopy(kCFAllocatorDefault, val, kCFStringEncodingUTF8, kCFAllocatorNull)) != NULL) {
+			ret = IORegistryEntrySetCFProperty(nvram_entry, cf_key, cf_val);
+			CFRelease(cf_val);
+		}
+		CFRelease(cf_key);
+	}
+	return ret;
+}
+
+static kern_return_t
+sync_nonce(io_registry_entry_t nvram_entry) {
+	if(set_nvram_prop(nvram_entry, "temp_key", "temp_val") != KERN_SUCCESS || set_nvram_prop(nvram_entry, kIONVRAMDeletePropertyKey, "temp_key") != KERN_SUCCESS || set_nvram_prop(nvram_entry, kIONVRAMForceSyncNowPropertyKey, kBootNoncePropertyKey) != KERN_SUCCESS) {
+		puts("Please use \"ideviceenterrecovery UDID\" to enter recovery mode.");
+	}
+	return KERN_SUCCESS;
+}
+
+static size_t
+hash_nonce(uint64_t nonce, uint8_t nonce_d[CC_SHA384_DIGEST_LENGTH]) {
+	io_registry_entry_t chosen = IORegistryEntryFromPath(kIOMasterPortDefault, kIODeviceTreePlane ":/chosen");
+	struct {
+		uint32_t generated, key_id, key_sz, val[4], key[4], zero, pad;
+	} key;
+	size_t out_sz, nonce_d_sz = 0, hash_method_len;
+	uint64_t buf[] = { 0, nonce };
+	kaddr_t aes_object, keys_ptr;
+	CFDataRef hash_method_cf;
+	const char *hash_method;
+	io_service_t aes_serv;
+	uint32_t key_cnt;
+
+	if(chosen != IO_OBJECT_NULL) {
+		if((hash_method_cf = IORegistryEntryCreateCFProperty(chosen, CFSTR("crypto-hash-method"), kCFAllocatorDefault, kNilOptions)) != NULL) {
+			if(CFGetTypeID(hash_method_cf) == CFDataGetTypeID() && (hash_method_len = (size_t)CFDataGetLength(hash_method_cf)) != 0 && (hash_method = (const char *)CFDataGetBytePtr(hash_method_cf))[hash_method_len - 1] == '\0') {
+				if(strcmp(hash_method, "sha1") == 0) {
+					nonce_d_sz = CC_SHA1_DIGEST_LENGTH;
+					CC_SHA1(&nonce, sizeof(nonce), nonce_d);
+				} else if(strcmp(hash_method, "sha2-384") == 0) {
+					nonce_d_sz = CC_SHA384_DIGEST_LENGTH;
+					if(t1sz_boot == 0) {
+						CC_SHA384(&nonce, sizeof(nonce), nonce_d);
+					} else if((aes_serv = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOAESAccelerator"))) != IO_OBJECT_NULL) {
+						printf("aes_serv: 0x%" PRIX32 "\n", aes_serv);
+						if(lookup_io_object(aes_serv, &aes_object) == KERN_SUCCESS) {
+							kxpacd(&aes_object);
+							printf("aes_object: " KADDR_FMT "\n", aes_object);
+							if(kread_addr(aes_object + IO_AES_ACCELERATOR_SPECIAL_KEYS_OFF, &keys_ptr) == KERN_SUCCESS) {
+								printf("keys_ptr: " KADDR_FMT "\n", keys_ptr);
+								if(kread_buf(aes_object + IO_AES_ACCELERATOR_SPECIAL_KEY_CNT_OFF, &key_cnt, sizeof(key_cnt)) == KERN_SUCCESS) {
+									printf("key_cnt: 0x%" PRIX32 "\n", key_cnt);
+									while(key_cnt-- != 0 && kread_buf(keys_ptr + key_cnt * sizeof(key), &key, sizeof(key)) == KERN_SUCCESS) {
+										printf("generated: 0x%" PRIX32 ", key_id: 0x%" PRIX32 ", key_sz: 0x%" PRIX32 ", val: 0x%08" PRIX32 "%08" PRIX32 "%08" PRIX32 "%08" PRIX32 "\n", key.generated, key.key_id, key.key_sz, __builtin_bswap32(key.val[0]), __builtin_bswap32(key.val[1]), __builtin_bswap32(key.val[2]), __builtin_bswap32(key.val[3]));
+										if(key.generated == 1 && key.key_id == 0x8A3 && key.key_sz == 8 * kCCKeySizeAES128) {
+											if(CCCrypt(kCCEncrypt, kCCAlgorithmAES128, 0, key.val, kCCKeySizeAES128, NULL, buf, sizeof(buf), buf, sizeof(buf), &out_sz) == kCCSuccess && out_sz == sizeof(buf)) {
+												CC_SHA384(buf, sizeof(buf), nonce_d);
+											}
+											break;
+										}
+									}
+								}
+							}
+						}
+						IOObjectRelease(aes_serv);
+					}
+				}
+			}
+			CFRelease(hash_method_cf);
 		}
 		IOObjectRelease(chosen);
 	}
-	if(path == NULL) {
-		path_len = sizeof(BOOT_PATH);
-		path = malloc(path_len);
-	}
-	if(path != NULL) {
-		memcpy(path + (path_len - sizeof(BOOT_PATH)), BOOT_PATH, sizeof(BOOT_PATH));
-	}
-	return path;
+	return MIN(nonce_d_sz, 32);
 }
 
 kern_return_t
-pfinder_init_offsets(void) {
+dimentio_preinit(uint64_t *nonce, bool set, uint8_t nonce_d[CC_SHA384_DIGEST_LENGTH], size_t *nonce_d_sz) {
+	io_registry_entry_t nvram_entry = IORegistryEntryFromPath(kIOMasterPortDefault, kIODeviceTreePlane ":/options");
+	char nonce_hex[2 * sizeof(*nonce) + sizeof("0x")];
 	kern_return_t ret = KERN_FAILURE;
-	pfinder_t pfinder;
-	char *boot_path;
 
-	if((boot_path = get_boot_path()) != NULL) {
-		KERNINFRA_LOG(KERNLOG_INIT, "boot_path: %s\n", boot_path);
-		if(pfinder_init_file(&pfinder, boot_path) == KERN_SUCCESS) {
-			//pfinder.kslide = kslide;
-			uint64_t prov_kslide = 0, prov_kbase = 0;
-			kernel_getbase(&prov_kbase, &prov_kslide);
-			if (prov_kbase) {
-				pfinder.kslide = prov_kbase - pfinder.base;
-			} else if (prov_kslide) {
-				pfinder.kslide = prov_kslide;
-			} else {
-				KERNINFRA_LOG(KERNLOG_INIT, "failed to retrive kslide!!!");
-				return KERN_FAILURE;
+	if(nvram_entry != IO_OBJECT_NULL) {
+		printf("nvram_entry: 0x%" PRIX32 "\n", nvram_entry);
+		if(set) {
+			snprintf(nonce_hex, sizeof(nonce_hex), "0x%016" PRIx64, *nonce);
+			if(set_nvram_prop(nvram_entry, kBootNoncePropertyKey, nonce_hex) == KERN_SUCCESS && set_nvram_prop(nvram_entry, kIONVRAMSyncNowPropertyKey, kBootNoncePropertyKey) == KERN_SUCCESS) {
+				ret = set_nvram_prop(nvram_entry, kIONVRAMForceSyncNowPropertyKey, kBootNoncePropertyKey);
 			}
-			
-			KERNINFRA_LOG(KERNLOG_INIT, "got kslide: %llx\n", pfinder.kslide);
-			if(pfinder_init_kbase(&pfinder) == KERN_SUCCESS && (kernproc = pfinder_kernproc(pfinder)) != 0) {
-				KERNINFRA_LOG(KERNLOG_INIT, "kernproc: " KADDR_FMT "\n", kernproc);
-				if((allproc = pfinder_allproc(pfinder)) != 0) {
-					KERNINFRA_LOG(KERNLOG_INIT, "allproc: " KADDR_FMT "\n", allproc);
-					ret = KERN_SUCCESS;
-				}
-			}
-			pfinder_term(&pfinder);
+		} else if(get_nvram_prop(nvram_entry, kBootNoncePropertyKey, nonce_hex, sizeof(nonce_hex)) == KERN_SUCCESS && sscanf(nonce_hex, "0x%016" PRIx64, nonce) == 1) {
+			ret = KERN_SUCCESS;
 		}
-		free(boot_path);
+		if(ret == KERN_SUCCESS) {
+			*nonce_d_sz = hash_nonce(*nonce, nonce_d);
+		}
+		IOObjectRelease(nvram_entry);
 	}
 	return ret;
 }
 
 void
-patchfinder_term(void) {
+dimentio_term(void) {
+	if(tfp0 != TASK_NULL) {
+		mach_port_deallocate(mach_task_self(), tfp0);
+	} else if(kernrw_0 != NULL) {
+		dlclose(kernrw_0);
+	} else if(krw_0 != NULL) {
+		dlclose(krw_0);
+	} else if(kmem_fd != -1) {
+		close(kmem_fd);
+	}
 	setpriority(PRIO_PROCESS, 0, 0);
 }
 
 kern_return_t
-patchfinder_init(void) {
-	if(setpriority(PRIO_PROCESS, 0, PRIO_MIN) != -1 && pfinder_init_offsets() == KERN_SUCCESS) {
-		return KERN_SUCCESS;
+dimentio_init(kaddr_t _kbase, kread_func_t _kread_buf, kwrite_func_t _kwrite_buf) {
+	kernrw_0_req_kernrw_func_t kernrw_0_req;
+	cpu_subtype_t subtype;
+	size_t sz;
+
+	sz = sizeof(subtype);
+	if(sysctlbyname("hw.cpusubtype", &subtype, &sz, NULL, 0) == 0) {
+		if(subtype == CPU_SUBTYPE_ARM64E) {
+#if TARGET_OS_OSX
+			t1sz_boot = 17;
+#else
+			t1sz_boot = 25;
+#endif
+		}
+		kbase = _kbase;
+		if(_kread_buf != NULL && _kwrite_buf != NULL) {
+			kread_buf = _kread_buf;
+			kwrite_buf = _kwrite_buf;
+		} else if(init_tfp0() == KERN_SUCCESS) {
+			printf("tfp0: 0x%" PRIX32 "\n", tfp0);
+			kread_buf = kread_buf_tfp0;
+			kwrite_buf = kwrite_buf_tfp0;
+		} else if((kernrw_0 = dlopen("/usr/lib/libkernrw.0.dylib", RTLD_LAZY)) != NULL && (kernrw_0_req = (kernrw_0_req_kernrw_func_t)dlsym(kernrw_0, "requestKernRw")) != NULL && kernrw_0_req() == 0) {
+			kread_buf = (kread_func_t)dlsym(kernrw_0, "kernRW_readbuf");
+			kwrite_buf = (kwrite_func_t)dlsym(kernrw_0, "kernRW_writebuf");
+		} else if((krw_0 = dlopen("/usr/lib/libkrw.0.dylib", RTLD_LAZY)) != NULL && (krw_0_kread = (krw_0_kread_func_t)dlsym(krw_0, "kread")) != NULL && (krw_0_kwrite = (krw_0_kwrite_func_t)dlsym(krw_0, "kwrite")) != NULL) {
+			kread_buf = kread_buf_krw_0;
+			kwrite_buf = kwrite_buf_krw_0;
+		} else if((kmem_fd = open("/dev/kmem", O_RDWR | O_CLOEXEC)) != -1) {
+			kread_buf = kread_buf_kmem;
+			kwrite_buf = kwrite_buf_kmem;
+		}
+		if(kread_buf != NULL && kwrite_buf != NULL) {
+			setpriority(PRIO_PROCESS, 0, PRIO_MIN);
+			if(pfinder_init_offsets() == KERN_SUCCESS && (!has_proc_struct_sz || kread_buf(proc_struct_sz_ptr, &proc_struct_sz, sizeof(proc_struct_sz)) == KERN_SUCCESS)) {
+				return KERN_SUCCESS;
+			}
+			setpriority(PRIO_PROCESS, 0, 0);
+		}
+		if(tfp0 != TASK_NULL) {
+			mach_port_deallocate(mach_task_self(), tfp0);
+		} else if(kernrw_0 != NULL) {
+			dlclose(kernrw_0);
+		} else if(krw_0 != NULL) {
+			dlclose(krw_0);
+		} else if(kmem_fd != -1) {
+			close(kmem_fd);
+		}
 	}
-	patchfinder_term();
 	return KERN_FAILURE;
+}
+
+kern_return_t
+dimentio(uint64_t *nonce, bool set, uint8_t nonce_d[CC_SHA384_DIGEST_LENGTH], size_t *nonce_d_sz) {
+	io_registry_entry_t nvram_entry = IORegistryEntryFromPath(kIOMasterPortDefault, kIODeviceTreePlane ":/options");
+	char nonce_hex[2 * sizeof(*nonce) + sizeof("0x")];
+	kaddr_t of_dict, os_string, string_ptr;
+	kern_return_t ret = KERN_FAILURE;
+
+	if(nvram_entry != IO_OBJECT_NULL) {
+		printf("nvram_entry: 0x%" PRIX32 "\n", nvram_entry);
+		if(find_task(getpid(), &our_task) == KERN_SUCCESS) {
+			kxpacd(&our_task);
+			printf("our_task: " KADDR_FMT "\n", our_task);
+			if((!set || nonce_generate() == KERN_SUCCESS) && get_of_dict(nvram_entry, &of_dict) == KERN_SUCCESS) {
+				printf("of_dict: " KADDR_FMT "\n", of_dict);
+				if((os_string = lookup_key_in_os_dict(of_dict, kBootNoncePropertyKey)) != 0) {
+					printf("os_string: " KADDR_FMT "\n", os_string);
+					if(kread_addr(os_string + OS_STRING_STRING_OFF, &string_ptr) == KERN_SUCCESS) {
+						kxpacd(&string_ptr);
+						printf("string_ptr: " KADDR_FMT "\n", string_ptr);
+						if(set) {
+							snprintf(nonce_hex, sizeof(nonce_hex), "0x%016" PRIx64, *nonce);
+							if(kwrite_buf(string_ptr, nonce_hex, sizeof(nonce_hex)) == KERN_SUCCESS) {
+								ret = sync_nonce(nvram_entry);
+							}
+						} else if(kread_buf(string_ptr, nonce_hex, sizeof(nonce_hex)) == KERN_SUCCESS && sscanf(nonce_hex, "0x%016" PRIx64, nonce) == 1) {
+							ret = KERN_SUCCESS;
+						}
+						if(ret == KERN_SUCCESS) {
+							*nonce_d_sz = hash_nonce(*nonce, nonce_d);
+						}
+					}
+				} else if(!set) {
+					puts("You have to set nonce first.");
+				}
+			}
+		}
+		IOObjectRelease(nvram_entry);
+	}
+	return ret;
 }

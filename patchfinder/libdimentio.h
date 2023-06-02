@@ -1,4 +1,4 @@
-/* Copyright 2020 0x7ff
+/* Copyright 2023 0x7ff
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,24 +13,25 @@
  * limitations under the License.
  */
 #ifndef LIBDIMENTIO_H
-#include "../rw_prov/rw_prov.h"
 #	define LIBDIMENTIO_H
 #	include <CommonCrypto/CommonCrypto.h>
 #	include <CoreFoundation/CoreFoundation.h>
-#	include <mach/mach.h>
 #	define KADDR_FMT "0x%" PRIX64
 #	ifndef MIN
 #		define MIN(a, b) ((a) < (b) ? (a) : (b))
 #	endif
-extern addr_t p_kbase, p_kslide, allproc;
-
+typedef uint64_t kaddr_t;
+typedef kern_return_t (*kread_func_t)(kaddr_t, void *, size_t), (*kwrite_func_t)(kaddr_t, const void *, size_t);
+extern kaddr_t p_kbase, p_kslide, allproc;
 void
-patchfinder_term(void);
+dimentio_term(void);
 
 kern_return_t
-patchfinder_init(void);
+dimentio_init(kaddr_t, kread_func_t, kwrite_func_t);
 
 kern_return_t
-pfinder_init_offsets(void);
+dimentio(uint64_t *, bool, uint8_t[CC_SHA384_DIGEST_LENGTH], size_t *);
 
+kern_return_t
+dimentio_preinit(uint64_t *, bool, uint8_t[CC_SHA384_DIGEST_LENGTH], size_t *);
 #endif

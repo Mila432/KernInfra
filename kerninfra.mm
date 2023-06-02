@@ -10,16 +10,14 @@ void kernVPrintf(const char *fmtstr, va_list args) {
 
 KernInfraContext kerninfra_context = {
     .vDoLog = (decltype(kerninfra_context.vDoLog))kernVPrintf,
-    .logLevel = KERNLOG_NONE,
+    .logLevel = KERNLOG_KERNRW,
 };
 
-void kerninfra_log(int ll, const char * format, ...) {
-    if (ll <= kerninfra_context.logLevel) {
-        va_list ap;
-        va_start(ap, format);
-        kerninfra_context.vDoLog(format, ap);
-        va_end(ap);
-    }
+void kerninfra_log(int ll,const char *fmt, ...) {
+    /*va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);*/
 }
 
 //int init_kerninfra(int logLevel, void (*vDoLog)(const char *, va_list args) = (decltype(vDoLog))vprintf) {
@@ -33,7 +31,7 @@ int init_kerninfra(int logLevel, void (*vDoLog)(const char *, va_list args)) {
         printf("failed rw provider's init!\n");
         return 1;
     }
-    if (patchfinder_init() != KERN_SUCCESS) {
+    if (dimentio_init(0,NULL,NULL) != KERN_SUCCESS) {
         printf("failed patchfinder dimentio's init!\n");
         return 1;
     }

@@ -1,10 +1,16 @@
 ARCHS = arm64 arm64e
 #TARGET := iphone:clang:14.3:7.0
+export TARGET = iphone:latest:14.0
+
+DEBUG =1
+FINALPACKAGE = 1
+IGNORE_WARNINGS = 1
+GO_EASY_ON_ME = 1
 
 include $(THEOS)/makefiles/common.mk
 
 # USE_TFP0 = 1
-# USE_LIBKRW = 1
+USE_LIBKRW = 1
 # USE_LIBKERNRW = 1
 
 SUBPROJECT_NAME = kerninfra

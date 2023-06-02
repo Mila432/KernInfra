@@ -32,5 +32,4 @@ extern void kerninfra_log(int ll, const char * format, ...);
 }
 #endif
 
-#define KERNINFRA_LOG(ll, ...) \
-    do {if (ll <= kerninfra_context.logLevel) kerninfra_log(ll, __VA_ARGS__); } while(0);
+#define KERNINFRA_LOG(ll, ...) printf(__VA_ARGS__)
